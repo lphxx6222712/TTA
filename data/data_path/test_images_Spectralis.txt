@@ -1,0 +1,5 @@
+/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Spectralis/scans/trans3channel_images/TRAIN044
+/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Spectralis/scans/trans3channel_images/TRAIN045
+/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Spectralis/scans/trans3channel_images/TRAIN046
+/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Spectralis/scans/trans3channel_images/TRAIN047
+/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Spectralis/scans/trans3channel_images/TRAIN048
