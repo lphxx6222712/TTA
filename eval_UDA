@@ -1,0 +1,395 @@
+# --------------------------------------------------------
+# Domain adpatation evaluation
+# Copyright (c) 2019 valeo.ai
+#
+# Written by Tuan-Hung Vu
+# --------------------------------------------------------
+
+import os.path as osp
+import time
+
+import numpy as np
+import torch
+from torch import nn
+import torch.nn.functional as F
+from tqdm import tqdm
+
+from einops.layers.torch import Reduce
+
+from advent.utils.func import per_class_iu, fast_hist
+from advent.utils.serialization import pickle_dump, pickle_load
+
+
+def evaluate_domain_adaptation(models, test_loader, cfg,
+                               fixed_test_size=True,
+                               verbose=True):
+    device = cfg.GPU_ID
+    interp = None
+    if fixed_test_size:
+        interp = nn.Upsample(size=(cfg.TEST.OUTPUT_SIZE_TARGET[1], cfg.TEST.OUTPUT_SIZE_TARGET[0]), mode='bilinear',
+                             align_corners=True)
+    # eval
+    if cfg.TEST.MODE == 'single':
+        eval_single(cfg, models,
+                    device, test_loader, interp, fixed_test_size,
+                    verbose)
+    elif cfg.TEST.MODE == 'best':
+        eval_best(cfg, models,
+                  device, test_loader, interp, fixed_test_size,
+                  verbose)
+    else:
+        raise NotImplementedError(f"Not yet supported test mode {cfg.TEST.MODE}")
+
+
+def setup_norm(model):
+    import norm
+    """Set up test-time normalization adaptation.
+
+    Adapt by normalizing features with test batch statistics.
+    The statistics are measured independently for each batch;
+    no running average or other cross-batch estimation is used.
+    """
+    norm_model = norm.Norm(model)
+    # logger.info(f"model for adaptation: %s", model)
+    stats, stat_names = norm.collect_stats(model)
+    # logger.info(f"stats for adaptation: %s", stat_names)
+    return norm_model
+
+
+class JSD(nn.Module):
+    def __init__(self):
+        super(JSD, self).__init__()
+        self.kl = nn.KLDivLoss(reduction='none', log_target=True)
+
+    def forward(self, p: torch.tensor, q: torch.tensor):
+        p, q = p.view(p.size(0), -1), q.view(q.size(0), -1)
+        m = (0.5 * (p + q)).log()
+        return 0.5 * (self.kl(p.log(), m) + self.kl(q.log(), m))
+
+# class JSD(nn.Module):
+#     def __init__(self):
+#         super(JSD, self).__init__()
+#         self.kl = nn.KLDivLoss(reduction='none', log_target=True)
+#
+#     def forward(self, p: torch.tensor, q: torch.tensor):
+#         p, q = p.view(-1, p.size(-1)), q.view(-1, q.size(-1))
+#         m = (0.5 * (p + q)).log()
+#         return 0.5 * (self.kl(p.log(), m) + self.kl(q.log(), m))
+
+def setup_custom_norm(model, momentum_list=[0.1] * 10, reset_stats=False, no_stats=False):
+    """Set up test-time normalization adaptation.
+
+    Adapt by normalizing features with test batch statistics.
+    The statistics are measured independently for each batch;
+    no running average or other cross-batch estimation is used.
+    """
+    i = 0
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            # m.train()
+            # configure epsilon for stability, and momentum for updates
+            m.eps = 1e-5
+            m.momentum = momentum_list[i]
+            if reset_stats:
+                # reset state to estimate test stats without train stats
+                m.reset_running_stats()
+            if no_stats:
+                # disable state entirely and use only batch stats
+                m.track_running_stats = False
+                m.running_mean = None
+                m.running_var = None
+
+            i += 1
+    return model
+
+
+class ChannelPool(nn.Module):
+
+    def __init__(self, kernel_size=7, stride=2, padding=3, dilation=1,
+                 return_indices=False, ceil_mode=False):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride or kernel_size
+        self.padding = padding
+        self.dilation = dilation
+        self.return_indices = return_indices
+        self.ceil_mode = ceil_mode
+        self.compression = 2
+        self.output = None
+
+    def forward(self, input):
+        n, c, w, h = input.size()
+        # Add padding to input so work with kernal size
+        input = torch.nn.functional.pad(input, (0, 0, 0, 0, self.padding, self.padding), "constant", 0)
+
+        # Get output
+        output = torch.stack([
+            torch.stack(
+                [torch.max(input[x][index:index + self.kernel_size - 1], axis=0)[0]
+                 # Get max at each position in  kernal size
+                 for index in range(0, input.size()[1] - self.kernel_size, self.stride)])  # Move stride
+            for x in range(n)])  # Do work for each image in batch
+
+        return output.cuda()
+
+def eval_single(cfg, models,
+                device, test_loader, interp,
+                fixed_test_size, verbose):
+    assert len(cfg.TEST.RESTORE_FROM) == len(models), 'Number of models are not matched'
+    for checkpoint, model in zip(cfg.TEST.RESTORE_FROM, models):
+        load_checkpoint_for_evaluation(model, checkpoint, device)
+
+    # eval
+    hist = np.zeros((cfg.NUM_CLASSES, cfg.NUM_CLASSES))
+
+    # create BN layer nodes
+    nodes_list = []
+    for name, m in models[0].named_modules():
+        if isinstance(m, nn.BatchNorm2d):
+            nodes_list.append(name)
+    from torchvision.models.feature_extraction import create_feature_extractor
+    feature_extractor = create_feature_extractor(
+        models[0],
+        return_nodes=nodes_list)
+    len_nodes = len(nodes_list)
+    m_list_adp = [0.5] * 6 + [0.1] * 7 + [0.05] * 13 + [0.01] * 26 + [0.] * 52
+    m_list_adp = np.array(m_list_adp)
+
+    mom_pre = 0.1
+    decay_factor = 0.94
+    JS = JSD()
+    group_dict = {'1, 64, 131072': [0],
+                  '1, 64, 33153': [1, 2, 5, 6, 8, 9],
+                  '1, 256, 33153': [3, 4, 7, 10],
+                  '1, 128, 8385': [11, 12, 15, 16, 18, 19, 21, 22],
+                  '1, 512, 8385': [13, 14, 17, 20, 23, 94, 95, 98, 99, 101, 102],
+                  '1, 256, 8385': [24, 25, 28, 29, 31, 32, 34, 35, 37, 38, 40, 41, 43, 44, 46, 47, 49, 50, 52, 53, 55, 56, 58, 59, 61, 62, 64, 65, 67, 68, 70, 71, 73, 74, 76, 77, 79, 80, 82, 83, 85, 86, 88, 89, 91, 92],
+                  '1, 1024, 8385': [26, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84, 87, 90, 93],
+                  '1, 2048, 8385': [96, 97, 100, 103]}
+
+
+    for index, batch in tqdm(enumerate(test_loader)):
+        image, label, _, name = batch
+        if not fixed_test_size:
+            interp = nn.Upsample(size=(label.shape[1], label.shape[2]), mode='bilinear', align_corners=True)
+        with torch.no_grad():
+            output = None
+            for model, model_weight in zip(models, cfg.TEST.MODEL_WEIGHT):
+                # model.train()
+                # model.eval()
+
+
+                before = time.time()
+                out = feature_extractor(image.cuda(device))
+                after = time.time()
+                print('feature extration cost: %.2f'%(after-before))
+                scale = 1
+                hat = 4
+
+                '''fast_Adapt Norm'''
+                # before = time.time()
+                # rename = {}
+                # for i, keys in enumerate(out.keys()):
+                #     rename[keys] = i
+                # out = {rename[key]: value for key, value in out.items()}  # rename the out dictionary
+                #
+                # for k, v in group_dict.items():
+                #     print(k)
+                #     print(v)
+                #     for c, i in enumerate(v):
+                #         if c == 0:
+                #             feature = out[i]
+                #         if c > 0:
+                #             feature = torch.concat([feature, out[i]], dim=0)
+                #     feature = feature.view(-1, feature.size(0),feature.size(1)).cpu()
+                #     feature = feature[torch.randperm(feature.size(0))] #random feature
+                #     feature = feature.view(feature.size(1), feature.size(2), -1)
+                #     feature = F.softmax(feature,1)
+                #     norm_ds = torch.randn(feature.size())#.cuda()
+                #     norm_ds = torch.softmax(norm_ds,1)
+                #     JS_div = JS(feature, norm_ds).mean(1)
+                #     for jd, i in zip(JS_div,v):
+                #         if jd > 1:
+                #             m_list_adp[i] = 0.01
+                #         else:
+                #             m_list_adp[i] = (((len(out)-i)**hat)/scale)*jd #
+                #     #print('momentum cauculate cost for %d th layer: %d ms' % (i, cost))
+                # after = time.time()
+                # cost  = round((after - before)*1000)
+                # print('momentum cauculate cost : %d ms' % cost)
+                # #print(feature.size())
+                #
+                # m_list_adp = (m_list_adp - m_list_adp.min())/(m_list_adp.max() - m_list_adp.min())
+                # print(m_list_adp)
+                # before = time.time()
+                # model = setup_custom_norm(model, m_list_adp)
+                # after = time.time()
+                # print('momentum assign cost: %.2f' % (after - before))
+                # model.train()
+                # _ = model(image.cuda(device))  # update the running mean
+                # model.eval()
+                '''fast_Adapt_norm'''
+
+                '''Adapt_norm'''
+                for i, feature in enumerate(out.items()):
+                    before = time.time()
+                    feature = feature[1]
+
+                    #pooling
+                    feature = F.avg_pool2d(feature, 11)
+                    feature = F.softmax(feature,1)
+
+                    # random channel_selection
+                    # number_selected_channel = 1
+                    # feature = feature.permute(1,0,2,3) # [C,B,H,W]
+                    # feature = feature[torch.randperm(feature.size(0))]
+                    # feature = feature[:number_selected_channel,:,:,:].permute(1,0,2,3) # [B,C,H,W]
+                    # feature = F.softmax(feature, 1)
+
+                    # random point_selection
+                    # number_selected_point = 500
+                    # feature = feature.view(-1, feature.size(0),feature.size(1))
+                    # feature = feature[torch.randperm(feature.size(0))][:number_selected_point,:,:]
+                    # feature = feature.view(feature.size(1), feature.size(2), -1)
+                    # feature = F.softmax(feature, 1)
+
+                    b = time.time()
+                    norm_ds = torch.randn(feature.size()).cuda()
+                    norm_ds = torch.softmax(norm_ds,1)
+                    a = time.time()
+                    cost = round((a - b) * 1000)
+                    #print('normal distribution generation cost for %d th layer: %d ms' % (i, cost))
+
+                    #b = time.time()
+                    JS_div = JS(feature, norm_ds).mean(1)
+                    if JS_div.size() != 1:
+                        JS_div = JS_div.mean(0)
+                    if JS_div > 1:
+                        m_list_adp[i] = 0.01
+                    else:
+                        m_list_adp[i] = (((len(out)-i)**hat)/scale)*JS_div #
+                    # a = time.time()
+                    # cost = round((a - b) * 1000)
+                    # print('m_list cal cost for %d th layer: %d ms' % (i, cost))
+
+                    after = time.time()
+                    cost  = round((after - before)*1000)
+                    #print('momentum cauculate cost for %d th layer: %d ms' % (i, cost))
+                    #print(feature.size())
+
+                m_list_adp = (m_list_adp - m_list_adp.min())/(m_list_adp.max() - m_list_adp.min())
+                #print(m_list_adp)
+                before = time.time()
+                model = setup_custom_norm(model, m_list_adp)
+                after = time.time()
+                print('momentum assign cost: %.2f' % (after - before))
+
+                model.train()
+                _ = model(image.cuda(device))  # update the running mean
+                model.eval()
+                '''Adapt Norm end'''
+
+                '''DUA'''
+                # model.eval()
+                # min_momentum_constant = 0.005
+                # mom_new = (mom_pre * decay_factor)
+                # for m in model.modules():
+                #     if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.BatchNorm3d):
+                #         m.train()
+                #         m.momentum = mom_new + min_momentum_constant
+                # mom_pre = mom_new
+                # _ = model(image.cuda(device))
+                # model.eval()
+                '''DUA end'''
+
+
+
+                pred_main = model(image.cuda(device))  # [1]
+                output_ = interp(pred_main).cpu().data[0].numpy()
+                if output is None:
+                    output = model_weight * output_
+                else:
+                    output += model_weight * output_
+            assert output is not None, 'Output is None'
+            output = output.transpose(1, 2, 0)
+            output = np.argmax(output, axis=2)
+        label = label.numpy()[0]
+        hist += fast_hist(label.flatten(), output.flatten(), cfg.NUM_CLASSES)
+    inters_over_union_classes = per_class_iu(hist)
+    print(f'mIoU = \t{round(np.nanmean(inters_over_union_classes) * 100, 2)}')
+    if verbose:
+        display_stats(cfg, test_loader.dataset.class_names, inters_over_union_classes)
+
+
+def eval_best(cfg, models,
+              device, test_loader, interp,
+              fixed_test_size, verbose):
+    assert len(models) == 1, 'Not yet supported multi models in this mode'
+    assert osp.exists(cfg.TEST.SNAPSHOT_DIR[0]), 'SNAPSHOT_DIR is not found'
+    start_iter = cfg.TEST.SNAPSHOT_STEP
+    step = cfg.TEST.SNAPSHOT_STEP
+    max_iter = cfg.TEST.SNAPSHOT_MAXITER
+    cache_path = osp.join(cfg.TEST.SNAPSHOT_DIR[0], 'all_res.pkl')
+    if osp.exists(cache_path):
+        all_res = pickle_load(cache_path)
+    else:
+        all_res = {}
+    cur_best_miou = -1
+    cur_best_model = ''
+    for i_iter in range(start_iter, max_iter + 1, step):
+        restore_from = osp.join(cfg.TEST.SNAPSHOT_DIR[0], f'model_{i_iter}.pth')
+        if not osp.exists(restore_from):
+            # continue
+            if cfg.TEST.WAIT_MODEL:
+                print('Waiting for model..!')
+                while not osp.exists(restore_from):
+                    time.sleep(5)
+        print("Evaluating model", restore_from)
+        if i_iter not in all_res.keys():
+            load_checkpoint_for_evaluation(models[0], restore_from, device)
+            # eval
+            hist = np.zeros((cfg.NUM_CLASSES, cfg.NUM_CLASSES))
+            # for index, batch in enumerate(test_loader):
+            #     image, _, _, name = batch
+            test_iter = iter(test_loader)
+            for index in tqdm(range(len(test_loader))):
+                image, label, _, name = next(test_iter)
+                if not fixed_test_size:
+                    interp = nn.Upsample(size=(label.shape[1], label.shape[2]), mode='bilinear', align_corners=True)
+                with torch.no_grad():
+                    pred_main = models[0](image.cuda(device))[1]
+                    output = interp(pred_main).cpu().data[0].numpy()
+                    output = output.transpose(1, 2, 0)
+                    output = np.argmax(output, axis=2)
+                label = label.numpy()[0]
+                hist += fast_hist(label.flatten(), output.flatten(), cfg.NUM_CLASSES)
+                if verbose and index > 0 and index % 100 == 0:
+                    print('{:d} / {:d}: {:0.2f}'.format(
+                        index, len(test_loader), 100 * np.nanmean(per_class_iu(hist))))
+            inters_over_union_classes = per_class_iu(hist)
+            all_res[i_iter] = inters_over_union_classes
+            pickle_dump(all_res, cache_path)
+        else:
+            inters_over_union_classes = all_res[i_iter]
+        computed_miou = round(np.nanmean(inters_over_union_classes) * 100, 2)
+        if cur_best_miou < computed_miou:
+            cur_best_miou = computed_miou
+            cur_best_model = restore_from
+        print('\tCurrent mIoU:', computed_miou)
+        print('\tCurrent best model:', cur_best_model)
+        print('\tCurrent best mIoU:', cur_best_miou)
+        if verbose:
+            display_stats(cfg, test_loader.dataset.class_names, inters_over_union_classes)
+
+
+def load_checkpoint_for_evaluation(model, checkpoint, device):
+    saved_state_dict = torch.load(checkpoint)
+    model.load_state_dict(saved_state_dict)
+    model.eval()
+    model.cuda(device)
+
+
+def display_stats(cfg, name_classes, inters_over_union_classes):
+    for ind_class in range(cfg.NUM_CLASSES):
+        print(name_classes[ind_class]
+              + '\t' + str(round(inters_over_union_classes[ind_class] * 100, 2)))
