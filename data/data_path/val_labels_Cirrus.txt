@@ -1,5 +1,0 @@
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Cirrus/scans/label/TRAIN015
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Cirrus/scans/label/TRAIN016
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Cirrus/scans/label/TRAIN017
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Cirrus/scans/label/TRAIN018
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Cirrus/scans/label/TRAIN019

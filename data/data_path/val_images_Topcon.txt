@@ -1,4 +1,0 @@
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Topcon/scans/trans3channel_images/TRAIN063
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Topcon/scans/trans3channel_images/TRAIN064
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Topcon/scans/trans3channel_images/TRAIN065
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Topcon/scans/trans3channel_images/TRAIN066

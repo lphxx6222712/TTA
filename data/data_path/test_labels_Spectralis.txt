@@ -1,5 +1,0 @@
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Spectralis/scans/label/TRAIN044
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Spectralis/scans/label/TRAIN045
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Spectralis/scans/label/TRAIN046
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Spectralis/scans/label/TRAIN047
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Spectralis/scans/label/TRAIN048

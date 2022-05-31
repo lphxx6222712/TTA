@@ -1,5 +1,0 @@
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Cirrus/scans/trans3channel_images/TRAIN015
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Cirrus/scans/trans3channel_images/TRAIN016
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Cirrus/scans/trans3channel_images/TRAIN017
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Cirrus/scans/trans3channel_images/TRAIN018
-/home/isalab201/Documents/hxx/dataset/RETOUCH/RETOUCH-TrainingSet-Cirrus/scans/trans3channel_images/TRAIN019
